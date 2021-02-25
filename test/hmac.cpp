@@ -143,7 +143,6 @@ public:
 	Integer iv = hex_to_integer(256, "6A09E667BB67AE853C6EF372A54FF53A510E527F9B05688C1F83D9AB5BE0CD19", PUBLIC);
 	Integer ipad_start = hex_to_integer(512, "36363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636", PUBLIC);
 	Integer opad_start = hex_to_integer(512, "5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c", PUBLIC);
-	Integer label_master_secret = hex_to_integer(104, "6d617374657220736563726574", PUBLIC);
 	Integer outer_end_pad = pad_int(512 + 256);
 
 	Integer ipad;
@@ -152,23 +151,19 @@ public:
 
 	BristolFashion hasher;
 
-	HMAC(BristolFashion hasher, string premaster_share, string client_random_hex, string server_random_hex) : hasher(hasher)
+	HMAC(BristolFashion hasher) : hasher(hasher)
 	{
-		Integer empty(0, 0, PUBLIC);
-		Integer premaster_share_alice = hex_to_integer(256, premaster_share, ALICE);
-		Integer premaster_share_bob = hex_to_integer(256, premaster_share, BOB);
-		Integer premaster_secret(256, 0, XOR);
-		premaster_secret = premaster_share_alice + premaster_share_bob;
-		ipad = xor_secret(ipad_start, premaster_secret);
-		opad = xor_secret(opad_start, premaster_secret);
+	}
 
-		Integer client_random_int = hex_to_integer(256, client_random_hex, ALICE);
-		Integer server_random_int = hex_to_integer(256, server_random_hex, ALICE);
-		Integer label_master_secret = hex_to_integer(104, "6d617374657220736563726574", PUBLIC); // "master secret"
-		seed = Integer(256 + 256 + 104, 0, PUBLIC);
-		copy_int(seed, server_random_int, 0, 0, 256);
-		copy_int(seed, client_random_int, 256, 0, 256);
-		copy_int(seed, label_master_secret, 512, 0, 104);
+	void set_seed(Integer &seed)
+	{
+		this->seed = seed;
+	}
+
+	void set_secret(Integer &secret)
+	{
+		ipad = xor_secret(ipad_start, secret);
+		opad = xor_secret(opad_start, secret);
 	}
 
 	vector<Integer> run(int t)
@@ -290,6 +285,30 @@ protected:
 	}
 };
 
+inline Integer tls_master_secret_seed(string client_random_hex, string server_random_hex)
+{
+	Integer client_random_int = hex_to_integer(256, client_random_hex, ALICE);
+	Integer server_random_int = hex_to_integer(256, server_random_hex, ALICE);
+	Integer label_master_secret = hex_to_integer(104, "6d617374657220736563726574", PUBLIC); // "master secret"
+	Integer seed(256 + 256 + 104, 0, PUBLIC);
+	copy_int(seed, server_random_int, 0, 0, 256);
+	copy_int(seed, client_random_int, 256, 0, 256);
+	copy_int(seed, label_master_secret, 512, 0, 104);
+	return seed;
+}
+
+inline Integer tls_key_expansion_seed(string client_random_hex, string server_random_hex)
+{
+	Integer client_random_int = hex_to_integer(256, client_random_hex, ALICE);
+	Integer server_random_int = hex_to_integer(256, server_random_hex, ALICE);
+	Integer label_master_secret = hex_to_integer(104, "6b657920657870616e73696f6e", PUBLIC); // "key expansion"
+	Integer seed(256 + 256 + 104, 0, PUBLIC);
+	copy_int(seed, client_random_int, 0, 0, 256);
+	copy_int(seed, server_random_int, 256, 0, 256);
+	copy_int(seed, label_master_secret, 512, 0, 104);
+	return seed;
+}
+
 int main(int argc, char **argv)
 {
 	string client_random = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -297,18 +316,43 @@ int main(int argc, char **argv)
 
 	int port, party;
 	parse_party_and_port(argv, &party, &port);
-	string share_hex = argv[3];
 
 	NetIO *io = new NetIO(party == ALICE ? nullptr : "127.0.0.1", port);
 	setup_semi_honest(io, party);
 
 	string filepath = "./test/sha256circuts/bristol_fashion/sha256.txt";
 	BristolFashion hasher(filepath.c_str());
-	HMAC hmac = HMAC(hasher, share_hex, client_random, server_random);
-	vector<Integer> U = hmac.run(2);
 
-	// 0x3946e027a4b0ab19540ff28d3b5369f75daf4737ce075f309882b72eb1d7f01e
-	debug_int(PUBLIC, U[1], "u_1");
+	HMAC hmac = HMAC(hasher);
+	{
+
+		Integer premaster_share_alice = hex_to_integer(256, "1", ALICE);
+		Integer premaster_share_bob = hex_to_integer(256, "0", BOB);
+		Integer premaster_secret(256, 0, XOR);
+		premaster_secret = premaster_share_alice + premaster_share_bob;
+
+		Integer seed = tls_master_secret_seed(client_random, server_random);
+		hmac.set_seed(seed);
+		hmac.set_secret(premaster_secret);
+		vector<Integer> key_material = hmac.run(2);
+		// 0x3946e027a4b0ab19540ff28d3b5369f75daf4737ce075f309882b72eb1d7f01e
+		debug_int(PUBLIC, key_material[0], "presmaster secret u_0");
+		debug_int(PUBLIC, key_material[1], "presmaster secret u_1");
+	}
+	{
+		Integer master_secret = hex_to_integer(256, "1", ALICE);
+		Integer seed = tls_key_expansion_seed(client_random, server_random);
+		hmac.set_seed(seed);
+		hmac.set_secret(master_secret);
+		vector<Integer> key_material = hmac.run(3);
+		//
+		// 7a0c47873a26a814301c0aef0a983e8f88a313a4ac7f2f68e6d22815334d065b
+		// 88cf536a56e915b7f8a0cd4cd8f4168a1f0a387f5c8f29afa15537fdc39a07a6
+		// f3abf2e084dc5db5c021d7ff11d7b2e2176f64fd7895bf216c0f9e846fa7713a
+		debug_int(PUBLIC, key_material[0], "key expansion u_0");
+		debug_int(PUBLIC, key_material[1], "key expansion u_1");
+		debug_int(PUBLIC, key_material[2], "key expansion u_2");
+	}
 
 	cout << CircuitExecution::circ_exec->num_and() << endl;
 	finalize_semi_honest();
