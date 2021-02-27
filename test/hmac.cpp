@@ -111,20 +111,34 @@ inline void copy_int(Integer &dst, Integer &src, size_t offset_dst, size_t offse
 	}
 }
 
+// inline Integer xor_secret(Integer &pad, Integer &secret)
+// {
+// 	Integer res(512, 0, XOR);
+// 	int off = 512 - secret.size();
+// 	int u = 64 - off / 8;
+
+// 	for (int i = 0; i < u; i++)
+// 	{
+// 		int ii = i * 8;
+// 		int iii = (u - 1 - i) * 8;
+// 		for (int j = 0; j < 8; j++)
+// 		{
+// 			res[off + ii + j] = pad[ii + j] ^ secret[iii + j];
+// 		}
+// 	}
+// 	copy_int(res, pad, 0, 0, off);
+// 	return res;
+// }
+
 inline Integer xor_secret(Integer &pad, Integer &secret)
 {
 	Integer res(512, 0, XOR);
-	int u = 32;
-	for (int i = 0; i < u; i++)
+	int off = 512 - secret.size();
+	copy_int(res, pad, 0, 0, 512);
+	for (int i = 0; i < secret.size(); i++)
 	{
-		int ii = i * 8;
-		int iii = (u - 1 - i) * 8;
-		for (int j = 0; j < 8; j++)
-		{
-			res[256 + ii + j] = pad[ii + j] ^ secret[iii + j];
-		}
+		res[i + off] = pad[i + off] ^ secret[i];
 	}
-	copy_int(res, pad, 0, 0, 256);
 	return res;
 }
 
@@ -134,6 +148,30 @@ inline Integer pad_int(int len)
 	Integer pad(pad_int_len, len, PUBLIC);
 	pad[len - 1] = 1;
 	return pad;
+}
+
+inline Integer tls_master_secret_seed(string client_random_hex, string server_random_hex)
+{
+	Integer client_random_int = hex_to_integer(256, client_random_hex, ALICE);
+	Integer server_random_int = hex_to_integer(256, server_random_hex, ALICE);
+	Integer label_master_secret = hex_to_integer(104, "6d617374657220736563726574", PUBLIC); // "master secret"
+	Integer seed(256 + 256 + 104, 0, PUBLIC);
+	copy_int(seed, server_random_int, 0, 0, 256);
+	copy_int(seed, client_random_int, 256, 0, 256);
+	copy_int(seed, label_master_secret, 512, 0, 104);
+	return seed;
+}
+
+inline Integer tls_key_expansion_seed(string client_random_hex, string server_random_hex)
+{
+	Integer client_random_int = hex_to_integer(256, client_random_hex, ALICE);
+	Integer server_random_int = hex_to_integer(256, server_random_hex, ALICE);
+	Integer label_master_secret = hex_to_integer(104, "6b657920657870616e73696f6e", PUBLIC); // "key expansion"
+	Integer seed(256 + 256 + 104, 0, PUBLIC);
+	copy_int(seed, client_random_int, 0, 0, 256);
+	copy_int(seed, server_random_int, 256, 0, 256);
+	copy_int(seed, label_master_secret, 512, 0, 104);
+	return seed;
 }
 
 class HMAC
@@ -147,17 +185,11 @@ public:
 
 	Integer ipad;
 	Integer opad;
-	Integer seed;
 
 	BristolFashion hasher;
 
 	HMAC(BristolFashion hasher) : hasher(hasher)
 	{
-	}
-
-	void set_seed(Integer &seed)
-	{
-		this->seed = seed;
 	}
 
 	void set_secret(Integer &secret)
@@ -166,37 +198,71 @@ public:
 		opad = xor_secret(opad_start, secret);
 	}
 
-	vector<Integer> run(int t)
+	inline vector<Integer> derive_enc_keys_for_alice(string share, string client_random_hex, string server_random_hex)
 	{
+
+		Integer seed_master_secret = tls_master_secret_seed(client_random_hex, server_random_hex);
+		Integer premaster_share_alice = hex_to_integer(256, share, ALICE);
+		Integer premaster_share_bob = hex_to_integer(256, share, BOB);
+		Integer premaster_secret(256, 0, XOR);
+		premaster_secret = premaster_share_alice + premaster_share_bob;
+		this->set_secret(premaster_secret);
+
+		vector<Integer> key_material_master_secret = this->run(2, seed_master_secret);
+
+		Integer master_secret(384, 0, XOR);
+		copy_int(master_secret, key_material_master_secret[0], 128, 0, 256);
+		copy_int(master_secret, key_material_master_secret[1], 0, 128, 128);
+
+		Integer seed_expansion = tls_key_expansion_seed(client_random_hex, server_random_hex);
+		this->set_secret(master_secret);
+		vector<Integer> key_material_expansion = this->run(3, seed_expansion);
+
+		Integer client_enc(128, 0, ALICE);
+		Integer server_enc(128, 0, ALICE);
+		copy_int(client_enc, key_material_expansion[2], 0, 128, 128);
+		copy_int(server_enc, key_material_expansion[2], 0, 0, 128);
+		vector<Integer> enc_keys;
+		enc_keys.push_back(client_enc);
+		enc_keys.push_back(server_enc);
+
+		return enc_keys;
+	}
+
+	vector<Integer> run(int t, Integer seed)
+	{
+
 		Integer empty(0, 0, PUBLIC);
 		vector<Integer> A;
 		for (int i = 0; i < t; i++)
 		{
+			// * a_i can be public
+			// * after calculating a_1 in 2PC
+			//	remaining a_i can be calculated locally by ALICE
 			Integer state(256, 0, PUBLIC);
 			if (i == 0)
 			{
-				state = inner(this->seed, empty);
+				state = inner_hmac(seed, empty);
 			}
 			else
 			{
-				state = inner(A[i - 1], empty);
+				state = inner_hmac(A[i - 1], empty);
 			}
-			state = outer(state);
+			state = outer_hmac(state);
 			A.push_back(state);
 		}
 		vector<Integer> U;
 		for (int i = 0; i < t; i++)
 		{
-			Integer state = inner(this->seed, A[i]);
-			state = outer(state);
+			Integer state = inner_hmac(seed, A[i]);
+			state = outer_hmac(state);
 			U.push_back(state);
 		}
-
 		return U;
 	}
 
 protected:
-	Integer inner(Integer &seed, Integer &chain)
+	Integer inner_hmac(Integer &seed, Integer &chain)
 	{
 
 		int block_size = this->ipad.size() + seed.size() + chain.size();
@@ -206,16 +272,21 @@ protected:
 		// key = (premaster_secret^ipad)<64>
 		// hash_1 = hash(ipad<64>, seed<_>)
 
-		// first iteration:
+		// * input: xor
+		// * intermadiate compression results: public
+		// * output: public
+
+		// inner compression:
 		// in 2PC
 		// inp_1 = [iv<32>, ipad<64>]
-		Integer inp_1(512 + 256, 0, XOR);
+		Integer inp_inner(512 + 256, 0, PUBLIC);
 		Integer out(256, 0, PUBLIC);
-		copy_int(inp_1, this->iv, 512, 0, 256);
-		copy_int(inp_1, this->ipad, 0, 0, 512);
-		hasher.compute(out.bits.data(), inp_1.bits.data());
+		copy_int(inp_inner, this->iv, 512, 0, 256);
+		// TODO: copying public data into xor?
+		copy_int(inp_inner, this->ipad, 0, 0, 512);
+		hasher.compute(out.bits.data(), inp_inner.bits.data());
 
-		Integer inp(512 + 256, 0, ALICE);
+		Integer inp(512 + 256, 0, PUBLIC);
 		int z = block_size / 512;
 		int pad_size = block_size % 512;
 		int seed_off = seed.size();
@@ -224,12 +295,13 @@ protected:
 			z -= 1;
 		}
 
-		// ALICE only
+		// outer compressions:
+		// TODO: can be ALICE only computation
 		for (int i = 0; i < z; i++)
 		{
 			// new_iv<32> = out<32>
 			// inp = [new_iv<32>, seed[_:_]<_>, pad<_>]
-			Integer inp(512 + 256, 0, ALICE);
+			Integer inp(512 + 256, 0, PUBLIC);
 			copy_int(inp, out, 512, 0, 256);
 			if (i == 0 && has_chain)
 			{
@@ -260,20 +332,27 @@ protected:
 		return out;
 	}
 
-	Integer outer(Integer &chain)
+	Integer outer_hmac(Integer &chain)
 	{
 
+		// TODO: we arrive at same intermadiate compression result
+		//	many times. we may want to consider store and reuse this value
+
+		// * input: xor
+		// * intermadiate compression result: public
+		// * output: xor
+
+		// inner compression:
 		// inp = [iv<32>, opad_premaster_secret<64>]
-		// TODO: very same calculation occurs many times, we may want to store the result and reuse it.
-		Integer inp(512 + 256, 0, XOR);
+		Integer inp(512 + 256, 0, PUBLIC);
 		Integer out_1(256, 0, PUBLIC);
 		copy_int(inp, this->iv, 512, 0, 256);
 		copy_int(inp, this->opad, 0, 0, 512);
 		hasher.compute(out_1.bits.data(), inp.bits.data());
 
+		// outer compression:
 		// new_iv<32> = out_1<32>
 		// inp = [new_iv<32>, chain<32>, pad<32>]
-		// TODO: consider that this can be ALICE only
 		Integer inp_2(512 + 256, 0, PUBLIC);
 		Integer out_2(256, 0, PUBLIC);
 		copy_int(inp_2, out_1, 512, 0, 256);
@@ -285,29 +364,12 @@ protected:
 	}
 };
 
-inline Integer tls_master_secret_seed(string client_random_hex, string server_random_hex)
-{
-	Integer client_random_int = hex_to_integer(256, client_random_hex, ALICE);
-	Integer server_random_int = hex_to_integer(256, server_random_hex, ALICE);
-	Integer label_master_secret = hex_to_integer(104, "6d617374657220736563726574", PUBLIC); // "master secret"
-	Integer seed(256 + 256 + 104, 0, PUBLIC);
-	copy_int(seed, server_random_int, 0, 0, 256);
-	copy_int(seed, client_random_int, 256, 0, 256);
-	copy_int(seed, label_master_secret, 512, 0, 104);
-	return seed;
-}
+// int main(int argc, char **argv)
+// {
+// 	setup_plain_prot(false, "");
 
-inline Integer tls_key_expansion_seed(string client_random_hex, string server_random_hex)
-{
-	Integer client_random_int = hex_to_integer(256, client_random_hex, ALICE);
-	Integer server_random_int = hex_to_integer(256, server_random_hex, ALICE);
-	Integer label_master_secret = hex_to_integer(104, "6b657920657870616e73696f6e", PUBLIC); // "key expansion"
-	Integer seed(256 + 256 + 104, 0, PUBLIC);
-	copy_int(seed, client_random_int, 0, 0, 256);
-	copy_int(seed, server_random_int, 256, 0, 256);
-	copy_int(seed, label_master_secret, 512, 0, 104);
-	return seed;
-}
+// 	finalize_plain_prot();
+// }
 
 int main(int argc, char **argv)
 {
@@ -324,35 +386,19 @@ int main(int argc, char **argv)
 	BristolFashion hasher(filepath.c_str());
 
 	HMAC hmac = HMAC(hasher);
+	string secret;
+	if (party == ALICE)
 	{
-
-		Integer premaster_share_alice = hex_to_integer(256, "1", ALICE);
-		Integer premaster_share_bob = hex_to_integer(256, "0", BOB);
-		Integer premaster_secret(256, 0, XOR);
-		premaster_secret = premaster_share_alice + premaster_share_bob;
-
-		Integer seed = tls_master_secret_seed(client_random, server_random);
-		hmac.set_seed(seed);
-		hmac.set_secret(premaster_secret);
-		vector<Integer> key_material = hmac.run(2);
-		// 0x3946e027a4b0ab19540ff28d3b5369f75daf4737ce075f309882b72eb1d7f01e
-		debug_int(PUBLIC, key_material[0], "presmaster secret u_0");
-		debug_int(PUBLIC, key_material[1], "presmaster secret u_1");
+		secret = "1";
 	}
+	else
 	{
-		Integer master_secret = hex_to_integer(256, "1", ALICE);
-		Integer seed = tls_key_expansion_seed(client_random, server_random);
-		hmac.set_seed(seed);
-		hmac.set_secret(master_secret);
-		vector<Integer> key_material = hmac.run(3);
-		//
-		// 7a0c47873a26a814301c0aef0a983e8f88a313a4ac7f2f68e6d22815334d065b
-		// 88cf536a56e915b7f8a0cd4cd8f4168a1f0a387f5c8f29afa15537fdc39a07a6
-		// f3abf2e084dc5db5c021d7ff11d7b2e2176f64fd7895bf216c0f9e846fa7713a
-		debug_int(PUBLIC, key_material[0], "key expansion u_0");
-		debug_int(PUBLIC, key_material[1], "key expansion u_1");
-		debug_int(PUBLIC, key_material[2], "key expansion u_2");
+		secret = "0";
 	}
+	vector<Integer> enc_keys = hmac.derive_enc_keys_for_alice(secret, client_random, server_random);
+	// expect
+	// client enc: bb0941a9c66263c9106bab97169183a4
+	// server enc: 30e6464281fd14092b1a30af241007cb
 
 	cout << CircuitExecution::circ_exec->num_and() << endl;
 	finalize_semi_honest();
